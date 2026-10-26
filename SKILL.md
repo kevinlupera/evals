@@ -486,7 +486,8 @@ report = await experiment.run_evaluations_async(task, max_workers=10)
 ```
 
 - `task` may be sync or async — async tasks require `run_evaluations_async`; passing one to `run_evaluations` raises `ValueError`.
-- `max_workers` defaults to 10; the runner caps it at `len(cases)`.
+- `max_workers` defaults to 10 and must be >= 1; the runner caps it at `len(cases)`.
+- A case whose task or tracing raises is recorded as a failed row; the other cases still run. A `CancelledError` escaping the task stops the run and propagates.
 - `TracedHandler` shares a single in-memory exporter, so it is **not** safe under `max_workers > 1`. Either run sequentially or build a per-call `TracedHandler` inside the task.
 - Red-team runs pass `agent_factory=` to the run method, not the constructor (see Red Team section).
 

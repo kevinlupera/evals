@@ -550,11 +550,17 @@ class Experiment(Generic[InputT, OutputT, ReportT]):
             trace_id = None
 
             try:
+                try:
+                    case_input_attribute = serialize(case.input)
+                except Exception as e:
+                    results[index] = self._failed_case_result(case, e)
+                    continue
+
                 with self._tracer.start_as_current_span(
                     f"execute_case {case_name}",
                     attributes={
                         "gen_ai.evaluation.case.name": case_name,
-                        "gen_ai.evaluation.case.input": serialize(case.input),
+                        "gen_ai.evaluation.case.input": case_input_attribute,
                     },
                 ) as case_span:
                     try:
@@ -599,27 +605,36 @@ class Experiment(Generic[InputT, OutputT, ReportT]):
 
                     except Exception as e:
                         case_span.record_exception(e)
-                        # Handle task execution errors
-                        evaluator_results = []
-                        for evaluator in self._evaluators:
-                            evaluator_results.append(
-                                {
-                                    "evaluator_name": evaluator.get_name(),
-                                    "evaluator_type": evaluator.get_type_name(),
-                                    "test_pass": False,
-                                    "score": 0,
-                                    "reason": f"An error occurred: {str(e)}",
-                                    "detailed_results": [],
-                                }
-                            )
-                        results[index] = {
-                            "case": case.model_dump(),
-                            "evaluator_results": evaluator_results,
-                            "diagnosis": None,
-                            "recommendation": None,
-                        }
+                        results[index] = self._failed_case_result(case, e)
             finally:
                 queue.task_done()
+
+    def _failed_case_result(self, case: Case[InputT, OutputT], error: Exception) -> dict:
+        """Build the result row recorded when a case cannot be executed.
+
+        Args:
+            case: The case that failed.
+            error: The exception that stopped the case.
+
+        Returns:
+            A result dict that fails every evaluator with the error message as the reason.
+        """
+        return {
+            "case": case.model_dump(),
+            "evaluator_results": [
+                {
+                    "evaluator_name": evaluator.get_name(),
+                    "evaluator_type": evaluator.get_type_name(),
+                    "test_pass": False,
+                    "score": 0,
+                    "reason": f"An error occurred: {str(error)}",
+                    "detailed_results": [],
+                }
+                for evaluator in self._evaluators
+            ],
+            "diagnosis": None,
+            "recommendation": None,
+        }
 
     def run_evaluations(
         self,
@@ -659,14 +674,22 @@ class Experiment(Generic[InputT, OutputT, ReportT]):
             task: The task function to run on each case. This function should take in InputT and returns
                 either OutputT or {"output": OutputT, "trajectory": ...}. The task can either run
                 synchronously or asynchronously.
-            max_workers: Maximum number of parallel workers (default: 10)
+            max_workers: Maximum number of parallel workers (default: 10). Must be at least 1.
             evaluation_data_store: Optional store for loading/saving evaluation data. When provided, cached
                 results are loaded instead of running the task, and new results are saved after task execution.
 
         Returns:
             A single EvaluationReport flattened across every evaluator. Each row in `cases` carries
             an `evaluator` key naming which evaluator produced it.
+
+        Raises:
+            ValueError: If max_workers is less than 1.
+            asyncio.CancelledError: If the task lets a CancelledError escape. The remaining cases are
+                not run.
         """
+        if max_workers < 1:
+            raise ValueError(f"max_workers must be >= 1, got {max_workers}")
+
         self._validate_evaluator_names()
 
         if evaluation_data_store is not None:
@@ -684,10 +707,12 @@ class Experiment(Generic[InputT, OutputT, ReportT]):
             asyncio.create_task(self._worker(queue, task, results, evaluation_data_store)) for _ in range(num_workers)
         ]
 
-        await queue.join()
-        for worker in workers:
-            worker.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
         # Organize results by evaluator (keyed on instance name so two instances
         # of the same class with distinct `name=` kwargs do not collide).

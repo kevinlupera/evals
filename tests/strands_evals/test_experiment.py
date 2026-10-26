@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import random
+import threading
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -978,6 +979,102 @@ async def test_experiment_run_evaluations_async_with_errors():
     # Check that error message is in reasons
     error_reasons = [r for r in report.reasons if "Test error" in r]
     assert len(error_reasons) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_workers", [1, 3])
+async def test_experiment_run_evaluations_async_isolates_case_whose_input_cannot_be_traced(max_workers):
+    """A case input the tracer cannot serialize fails only that case instead of hanging or crashing the run"""
+    cases = [
+        Case(name="first", input="hello", expected_output="hello"),
+        Case(name="untraceable", input={("tuple", "key"): "value"}, expected_output="hello"),
+        Case(name="last", input="hello", expected_output="hello"),
+    ]
+    experiment = Experiment(cases=cases, evaluators=[MockEvaluator()])
+
+    report = await asyncio.wait_for(
+        experiment.run_evaluations_async(lambda c: "hello", max_workers=max_workers), timeout=5
+    )
+
+    assert [case_data["name"] for case_data in report.cases] == ["first", "untraceable", "last"]
+    assert report.scores == [1.0, 0, 1.0]
+    assert report.test_passes == [True, False, True]
+    assert report.reasons[0] == "Mock evaluation"
+    assert report.reasons[1].startswith("An error occurred: keys must be str")
+    assert report.reasons[2] == "Mock evaluation"
+
+
+def test_experiment_run_evaluations_isolates_case_whose_input_cannot_be_traced():
+    """The sync entry point finishes and reports the untraceable case as failed"""
+    cases = [
+        Case(name="untraceable", input={("tuple", "key"): "value"}, expected_output="hello"),
+        Case(name="next", input="hello", expected_output="hello"),
+    ]
+    experiment = Experiment(cases=cases, evaluators=[MockEvaluator()])
+
+    reports = []
+    runner = threading.Thread(
+        target=lambda: reports.append(experiment.run_evaluations(lambda c: "hello")),
+        daemon=True,
+    )
+    runner.start()
+    runner.join(timeout=5)
+
+    assert not runner.is_alive(), "run_evaluations did not finish"
+    report = reports[0]
+    assert report.scores == [0, 1.0]
+    assert report.test_passes == [False, True]
+    assert report.reasons[0].startswith("An error occurred: keys must be str")
+
+
+@pytest.mark.asyncio
+async def test_experiment_run_evaluations_async_surfaces_cancellation_raised_by_task():
+    """A CancelledError escaping the task propagates instead of leaving the run waiting forever"""
+    later_case_ran = False
+
+    async def task(c):
+        nonlocal later_case_ran
+        if c.name == "cancelled":
+            inner = asyncio.create_task(asyncio.sleep(10))
+            await asyncio.sleep(0)
+            inner.cancel()
+            await inner
+        later_case_ran = True
+        return c.input
+
+    cases = [
+        Case(name="cancelled", input="hello", expected_output="hello"),
+        Case(name="next", input="hello", expected_output="hello"),
+    ]
+    experiment = Experiment(cases=cases, evaluators=[MockEvaluator()])
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(experiment.run_evaluations_async(task, max_workers=1), timeout=5)
+    assert later_case_ran is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_workers", [0, -1])
+async def test_experiment_run_evaluations_async_rejects_non_positive_max_workers(max_workers, simple_task):
+    """max_workers below 1 raises instead of starting a run with no workers"""
+    experiment = Experiment(
+        cases=[Case(name="c", input="hello", expected_output="hello")], evaluators=[MockEvaluator()]
+    )
+
+    with pytest.raises(ValueError, match=f"max_workers must be >= 1, got {max_workers}"):
+        await asyncio.wait_for(experiment.run_evaluations_async(simple_task, max_workers=max_workers), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_experiment_run_evaluations_async_with_no_cases_still_returns_empty_report(simple_task):
+    """An experiment without cases keeps returning an empty report"""
+    experiment = Experiment(cases=[], evaluators=[MockEvaluator()])
+
+    report = await asyncio.wait_for(experiment.run_evaluations_async(simple_task), timeout=5)
+
+    assert report.scores == []
+    assert report.cases == []
+    assert report.overall_score == 0.0
 
 
 def test_experiment_run_evaluations_with_interactions():
